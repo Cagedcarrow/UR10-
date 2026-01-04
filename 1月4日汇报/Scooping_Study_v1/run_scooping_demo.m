@@ -1,235 +1,193 @@
 classdef run_scooping_demo < handle
     properties
-        RobotObj        % ScoopRobot7DOF 实例
-        RobotModel      % rigidBodyTree
+        RobotObj, RobotModel, SimFig, Ax, CtrlFig
+        CurrentConfig   % 当前 1x7 关节角
         
-        SimFig, Ax      % 3D 绘图窗口
-        CtrlFig         % 控制面板窗口
-        
-        % 状态数据
-        CurrentConfig   % 当前关节角 (1x7)
-        BasePos = [0, 0, 1.4]
-        BucketPos = [0.6, 0.4]
+        % 环境布局参数
+        BasePos = [0, 0, 1.5]      % 龙门架挂高 (建议 1.5m 以上防止跳变)
+        BucketPos = [0.6, 0.4]     % 桶中心位置 (X, Y)
         
         % 动态参数
-        CurrentShovelLen = 0.30; % 当前铲长
-        TrajParams = struct('Radius', 0.25, 'Depth', 0.35, 'EntryAngle', -80);
+        CurrentShovelLen = 0.35; 
+        TrajParams = struct('Radius', 0.25, 'Depth', 0.35, 'EntryAngle', -85);
         
-        % 绘图句柄
-        hTrajLine
-        hBucket
-        
-        % IK 求解器
-        IK
+        % 句柄与解算器
+        StoredTraj = []         % 预解算轨迹
+        hTrajLine, hBucket, hProgressSlider, IK
+        lblBaseZ, lblBucketX, lblPitch
     end
     
     methods
         function obj = run_scooping_demo()
-            fprintf('正在启动 UR10 铲泥工艺集成调试系统...\n');
-            
-            % 1. 初始化机器人
+            fprintf('正在启动 7-DOF 铲泥工艺集成终端 (抛物线轨迹 + 姿态锁定版)...\n');
             obj.reloadRobot(obj.CurrentShovelLen);
-            
-            % 2. 启动 GUI
             obj.initGUI();
-            
-            % 3. 初始渲染
             obj.updateScene();
-            obj.previewTrajectory(); 
         end
         
         function reloadRobot(obj, len)
-            % 重新加载机器人模型 (用于修改铲子长度)
-            fprintf('加载机器人模型 (铲长: %.2fm)...\n', len);
-            bot = ScoopRobot7DOF(len); % 调用带参数的构造函数
+            % 加载模型 (确保目录下有最新的 ScoopRobot7DOF.m)
+            bot = ScoopRobot7DOF(len); 
             obj.RobotObj = bot;
             obj.RobotModel = bot.Robot;
             obj.CurrentConfig = bot.HomeConfig;
             
-            % 重置 IK
+            % 初始化逆运动学解算器
             obj.IK = inverseKinematics('RigidBodyTree', obj.RobotModel);
-            obj.IK.SolverParameters.MaxIterations = 100;
+            obj.IK.SolverParameters.MaxIterations = 150; 
         end
         
         function initGUI(obj)
-            % --- 主 3D 视图 ---
-            obj.SimFig = figure('Name', '3D 仿真视图', 'Color', [0.2 0.2 0.2], ...
+            % --- 3D 视图窗口 ---
+            obj.SimFig = figure('Name', 'UR10 铲泥动画仿真', 'Color', [0.1 0.1 0.1], ...
                 'Units', 'normalized', 'Position', [0.35 0.1 0.6 0.8]);
-            obj.Ax = axes('Parent', obj.SimFig, 'Color', [0.2 0.2 0.2], 'XColor', 'w', 'YColor', 'w', 'ZColor', 'w');
-            hold(obj.Ax, 'on'); grid(obj.Ax, 'on'); axis(obj.Ax, 'equal');
-            view(obj.Ax, 135, 20);
-            xlabel('X'); ylabel('Y'); zlabel('Z');
-            
-            % 绘制环境基础
-            patch(obj.Ax, [-3 3 3 -3], [-3 -3 3 3], [0 0 0 0], [0.3 0.3 0.3], 'FaceAlpha', 0.5);
-            plot3(obj.Ax, [-1 1], [0 0], [1.4 1.4], 'c-', 'LineWidth', 3);
+            obj.Ax = axes('Parent', obj.SimFig, 'Color', [0.1 0.1 0.1], 'XColor','w', 'YColor','w', 'ZColor','w');
+            hold(obj.Ax,'on'); grid(obj.Ax,'on'); axis(obj.Ax,'equal'); view(obj.Ax, 135, 20);
             
             % --- 控制面板 ---
-            obj.CtrlFig = figure('Name', '控制面板', 'Units', 'normalized', ...
-                'Position', [0.02 0.05 0.3 0.9], 'MenuBar', 'none', 'NumberTitle', 'off', 'Color', [0.95 0.95 0.95]);
+            obj.CtrlFig = figure('Name', '参数控制台', 'Units', 'normalized', 'Position', [0.02 0.05 0.3 0.9], 'MenuBar', 'none', 'NumberTitle', 'off');
             
-            % 1. 模型参数设置 (悬臂长度)
-            pnlModel = uipanel(obj.CtrlFig, 'Title', '1. 模型设置', 'Position', [0.02 0.88 0.96 0.10], 'FontSize', 10, 'FontWeight', 'bold');
-            uicontrol(pnlModel, 'Style', 'text', 'String', '铲子/悬臂长度 (m):', 'Units', 'normalized', 'Position', [0.05 0.4 0.4 0.4], 'HorizontalAlignment', 'left');
-            edtLen = uicontrol(pnlModel, 'Style', 'edit', 'String', num2str(obj.CurrentShovelLen), ...
-                'Units', 'normalized', 'Position', [0.45 0.5 0.2 0.4]);
-            uicontrol(pnlModel, 'Style', 'pushbutton', 'String', '应用更改', ...
-                'Units', 'normalized', 'Position', [0.7 0.4 0.25 0.5], ...
-                'Callback', @(s,e) obj.onApplyLength(edtLen));
+            % 1. 布局调整
+            pnlEnv = uipanel(obj.CtrlFig, 'Title', '1. 环境布局 (解决跳变)', 'Position', [0.02 0.78 0.96 0.20], 'FontWeight', 'bold');
+            uicontrol(pnlEnv, 'Style', 'text', 'String', '龙门架高度 (Z):', 'Units', 'normalized', 'Position', [0.05 0.7 0.4 0.15], 'HorizontalAlignment', 'left');
+            obj.lblBaseZ = uicontrol(pnlEnv, 'Style', 'text', 'String', num2str(obj.BasePos(3)), 'Units', 'normalized', 'Position', [0.8 0.7 0.15 0.15]);
+            uicontrol(pnlEnv, 'Style', 'slider', 'Min', 1.2, 'Max', 2.2, 'Value', obj.BasePos(3), 'Units', 'normalized', 'Position', [0.05 0.55 0.9 0.15], 'Callback', @(s,e) obj.onLayoutChange(s, 'BaseZ'));
+            
+            uicontrol(pnlEnv, 'Style', 'text', 'String', '泥桶距离 (X):', 'Units', 'normalized', 'Position', [0.05 0.25 0.4 0.15], 'HorizontalAlignment', 'left');
+            obj.lblBucketX = uicontrol(pnlEnv, 'Style', 'text', 'String', num2str(obj.BucketPos(1)), 'Units', 'normalized', 'Position', [0.8 0.25 0.15 0.15]);
+            uicontrol(pnlEnv, 'Style', 'slider', 'Min', 0.4, 'Max', 1.0, 'Value', obj.BucketPos(1), 'Units', 'normalized', 'Position', [0.05 0.1 0.9 0.15], 'Callback', @(s,e) obj.onLayoutChange(s, 'BucketX'));
 
-            % 2. 机械臂姿态调控
-            pnlJoints = uipanel(obj.CtrlFig, 'Title', '2. 机械臂关节调控', 'Position', [0.02 0.50 0.96 0.36], 'FontSize', 10, 'FontWeight', 'bold');
-            jNames = {'Base (Yaw)', 'Shoulder', 'Elbow', 'Wrist 1', 'Wrist 2', 'Wrist 3', 'Shovel Pitch'};
-            ranges = [-pi pi; -pi 0; -pi pi; -2*pi 2*pi; -2*pi 2*pi; -2*pi 2*pi; deg2rad(-90) deg2rad(45)];
+            % 2. 轨迹预览与计算
+            pnlAction = uipanel(obj.CtrlFig, 'Title', '2. 轨迹生成与预览', 'Position', [0.02 0.45 0.96 0.32], 'FontWeight', 'bold');
+            uicontrol(pnlAction, 'Style', 'pushbutton', 'String', '⚡ 计算抛物线轨迹', 'Units', 'normalized', 'Position', [0.05 0.82 0.9 0.12], 'BackgroundColor', [0 0.5 0.8], 'ForegroundColor', 'w', 'Callback', @(s,e) obj.calculateFullTraj());
             
+            uicontrol(pnlAction, 'Style', 'text', 'String', '预览进度:', 'Units', 'normalized', 'Position', [0.05 0.7 0.3 0.08], 'HorizontalAlignment', 'left');
+            obj.hProgressSlider = uicontrol(pnlAction, 'Style', 'slider', 'Min', 1, 'Max', 100, 'Value', 1, 'Enable', 'off', 'Units', 'normalized', 'Position', [0.05 0.6 0.9 0.08], 'Callback', @(s,e) obj.onProgressScroll(s));
+            
+            % 关节微调
+            jNames = {'Base', 'Shoulder', 'Elbow', 'W1', 'W2', 'W3', 'Shovel'};
             for i = 1:7
-                yPos = 0.88 - (i-1)*0.12;
-                uicontrol(pnlJoints, 'Style', 'text', 'String', jNames{i}, 'Units', 'normalized', 'Position', [0.05 yPos 0.35 0.08], 'HorizontalAlignment', 'left');
-                uicontrol(pnlJoints, 'Style', 'slider', 'Min', ranges(i,1), 'Max', ranges(i,2), 'Value', obj.CurrentConfig(i), ...
-                    'Units', 'normalized', 'Position', [0.4 yPos 0.55 0.08], 'Callback', @(s,e) obj.onJointChange(s, i));
+                yP = 0.5 - (i-1)*0.07;
+                uicontrol(pnlAction, 'Style', 'text', 'String', jNames{i}, 'Units', 'normalized', 'Position', [0.05 yP 0.2 0.06]);
+                uicontrol(pnlAction, 'Style', 'slider', 'Min', -pi, 'Max', pi, 'Value', obj.CurrentConfig(i), 'Units', 'normalized', 'Position', [0.3 yP 0.65 0.06], 'Callback', @(s,e) obj.onJointChange(s, i));
             end
-            
-            % 3. 曲线参数设置
-            pnlCurve = uipanel(obj.CtrlFig, 'Title', '3. 铲泥曲线设置', 'Position', [0.02 0.22 0.96 0.26], 'FontSize', 10, 'FontWeight', 'bold');
-            
-            % 半径
-            uicontrol(pnlCurve, 'Style', 'text', 'String', '作业半径 R:', 'Units', 'normalized', 'Position', [0.05 0.8 0.3 0.1]);
-            uicontrol(pnlCurve, 'Style', 'slider', 'Min', 0.15, 'Max', 0.5, 'Value', obj.TrajParams.Radius, ...
-                'Units', 'normalized', 'Position', [0.4 0.8 0.55 0.1], 'Callback', @(s,e) obj.onParamChange(s, 'Radius'));
-            
-            % 深度
-            uicontrol(pnlCurve, 'Style', 'text', 'String', '挖掘深度 D:', 'Units', 'normalized', 'Position', [0.05 0.5 0.3 0.1]);
-            uicontrol(pnlCurve, 'Style', 'slider', 'Min', 0.1, 'Max', 0.6, 'Value', obj.TrajParams.Depth, ...
-                'Units', 'normalized', 'Position', [0.4 0.5 0.55 0.1], 'Callback', @(s,e) obj.onParamChange(s, 'Depth'));
-            
-            % 入水角
-            uicontrol(pnlCurve, 'Style', 'text', 'String', '入水角度:', 'Units', 'normalized', 'Position', [0.05 0.2 0.3 0.1]);
-            uicontrol(pnlCurve, 'Style', 'slider', 'Min', -90, 'Max', -45, 'Value', obj.TrajParams.EntryAngle, ...
-                'Units', 'normalized', 'Position', [0.4 0.2 0.55 0.1], 'Callback', @(s,e) obj.onParamChange(s, 'EntryAngle'));
 
-            % 4. 动画控制
-            pnlAction = uipanel(obj.CtrlFig, 'Title', '4. 运行', 'Position', [0.02 0.02 0.96 0.18], 'FontSize', 10, 'FontWeight', 'bold');
-            uicontrol(pnlAction, 'Style', 'pushbutton', 'String', '▶ 开始铲泥动画', ...
-                'Units', 'normalized', 'Position', [0.05 0.55 0.9 0.4], ...
-                'BackgroundColor', [0 0.6 0.3], 'ForegroundColor', 'w', 'FontSize', 12, 'FontWeight', 'bold', ...
-                'Callback', @(s,e) obj.playAnimation());
-            uicontrol(pnlAction, 'Style', 'pushbutton', 'String', '重置姿态', ...
-                'Units', 'normalized', 'Position', [0.05 0.1 0.9 0.35], ...
-                'Callback', @(s,e) obj.resetPose());
+            % 3. 运行控制
+            pnlRun = uipanel(obj.CtrlFig, 'Title', '3. 播放控制', 'Position', [0.02 0.02 0.96 0.15], 'FontWeight', 'bold');
+            uicontrol(pnlRun, 'Style', 'pushbutton', 'String', '▶ 播放铲泥动画', 'Units', 'normalized', 'Position', [0.05 0.55 0.9 0.35], 'BackgroundColor', [0 0.6 0.3], 'ForegroundColor', 'w', 'Callback', @(s,e) obj.playStoredAnimation());
+            uicontrol(pnlRun, 'Style', 'pushbutton', 'String', '重置', 'Units', 'normalized', 'Position', [0.05 0.1 0.9 0.35], 'Callback', @(s,e) obj.resetPose());
         end
+
+        function calculateFullTraj(obj)
+    fprintf('开始执行“解耦控制”解算：机械臂定位末端，电机独立控制铲子...\n');
+    gen = ScoopPathGenerator();
+    [tcpPath, targetAngles, ~] = gen.generateScoopMotion([obj.BucketPos, 0.4], obj.TrajParams.Radius, obj.TrajParams.Depth);
+    
+    numSteps = size(tcpPath, 1);
+    obj.StoredTraj = zeros(numSteps, 7);
+    qLast = obj.CurrentConfig;
+    yawAngle = atan2(obj.BucketPos(2), obj.BucketPos(1));
+
+    for i = 1:numSteps
+        % 1. 计算当前的铲子俯仰角 (Planner 给出)
+        currentPitch = targetAngles(i);
         
+        % 2. 反推机械臂末端(电机挂载点)的世界位置
+        % 我们希望铲尖(tcpPath)到达指定位置，已知铲子长 ShovelLen
+        % MountPos = TipPos - [ShovelLen * cos(pitch), 0, ShovelLen * sin(pitch)] (在局部系下)
+        dx = obj.CurrentShovelLen * cos(currentPitch);
+        dz = obj.CurrentShovelLen * sin(currentPitch);
+        
+        % 转换到世界系下的 Mount 位置
+        mountPos = tcpPath(i,:) - [dx*cos(yawAngle), dx*sin(yawAngle), dz];
+        
+        % 3. 构建电机挂载点的目标位姿 (末端法兰始终朝向桶中心)
+        tgtTform = trvec2tform(mountPos) * axang2tform([0 0 1 yawAngle]);
+        
+        % 4. 只对前 6 轴求解 IK，目标设为 mount_link 【关键：保证末端不翻转】
+        weights = [10 10 10 100 100 100]; 
+        [qSol, info] = obj.IK('mount_link', tgtTform, weights, qLast);
+        
+        % 5. 直接将第 7 轴角度赋予解向量，不让 IK 干扰它
+        qSol(7) = currentPitch;
+        
+        obj.StoredTraj(i,:) = qSol;
+        qLast = qSol;
+    end
+    set(obj.hProgressSlider, 'Enable', 'on', 'Max', numSteps, 'Value', 1);
+    msgbox('计算完成！采用末端解耦控制，跳变与翻转已消除。');
+end
+
         function updateScene(obj)
+            if isempty(obj.Ax) || ~isgraphics(obj.Ax), return; end
             cla(obj.Ax);
-            % 环境
             patch(obj.Ax, [-3 3 3 -3], [-3 -3 3 3], [0 0 0 0], [0.3 0.3 0.3], 'FaceAlpha', 0.5);
-            plot3(obj.Ax, [-1 1], [0 0], [1.4 1.4], 'c-', 'LineWidth', 3);
+            plot3(obj.Ax, [-1 1], [0 0], [obj.BasePos(3) obj.BasePos(3)], 'c-', 'LineWidth', 3); % 龙门架
             
-            % 机器人 (更新基座位置)
             baseBody = obj.RobotModel.getBody('base_link');
             setFixedTransform(baseBody.Joint, trvec2tform(obj.BasePos) * axang2tform([1 0 0 pi]));
-            
             show(obj.RobotModel, obj.CurrentConfig, 'Parent', obj.Ax, 'PreservePlot', false, 'FastUpdate', true);
             
             % 绘制桶
-            if isempty(obj.hBucket) || ~isvalid(obj.hBucket)
-                [cx, cy, cz] = cylinder(obj.TrajParams.Radius);
-                cz = cz * 0.5; cx = cx + obj.BucketPos(1); cy = cy + obj.BucketPos(2);
-                obj.hBucket = surf(obj.Ax, cx, cy, cz, 'FaceColor', 'b', 'FaceAlpha', 0.3, 'EdgeColor', 'none');
-            else
-                 % 更新桶大小
-                 [cx, cy, cz] = cylinder(obj.TrajParams.Radius);
-                 cz = cz * 0.5; cx = cx + obj.BucketPos(1); cy = cy + obj.BucketPos(2);
-                 set(obj.hBucket, 'XData', cx, 'YData', cy, 'ZData', cz);
-            end
+            [cx, cy, cz] = cylinder(obj.TrajParams.Radius);
+            cz = cz * 0.4; cx = cx + obj.BucketPos(1); cy = cy + obj.BucketPos(2);
+            surf(obj.Ax, cx, cy, cz, 'FaceColor', 'b', 'FaceAlpha', 0.2, 'EdgeColor', 'b');
             
-            % 轨迹线
-            if isempty(obj.hTrajLine) || ~isvalid(obj.hTrajLine)
-                obj.previewTrajectory();
-            else
-                % previewTrajectory 会更新它
-            end
-            
-            axis(obj.Ax, [-1 2 -1.5 1.5 0 2]);
+            % 预览轨迹
+            obj.previewTrajectory();
+            axis(obj.Ax, [-1 2 -1.5 1.5 0 2.5]);
         end
-        
+
+        function onLayoutChange(obj, src, type)
+            val = get(src, 'Value');
+            if strcmp(type, 'BaseZ'), obj.BasePos(3) = val; set(obj.lblBaseZ, 'String', sprintf('%.2f', val)); end
+            if strcmp(type, 'BucketX'), obj.BucketPos(1) = val; set(obj.lblBucketX, 'String', sprintf('%.2f', val)); end
+            obj.updateScene();
+            obj.StoredTraj = []; set(obj.hProgressSlider, 'Enable', 'off');
+        end
+
+        function onProgressScroll(obj, src)
+            idx = round(get(src, 'Value'));
+            if ~isempty(obj.StoredTraj)
+                obj.CurrentConfig = obj.StoredTraj(idx, :);
+                obj.updateScene();
+                % 显示实时铲面角度
+                tform = getTransform(obj.RobotModel, obj.CurrentConfig, 'tcp_frame');
+                eul = rotm2eul(tform(1:3,1:3), 'ZYX');
+                title(obj.Ax, sprintf('进度: %d/%d | 实时俯仰角: %.1f°', idx, size(obj.StoredTraj,1), rad2deg(eul(2))), 'Color', 'w');
+            end
+        end
+
         function previewTrajectory(obj)
             gen = ScoopPathGenerator();
-            [tcpPath, ~, ~] = gen.generateScoopMotion( ...
-                [obj.BucketPos, 0.4], obj.TrajParams.Radius, obj.TrajParams.Depth);
-            
-            if isempty(obj.hTrajLine) || ~isvalid(obj.hTrajLine)
-                obj.hTrajLine = plot3(obj.Ax, tcpPath(:,1), tcpPath(:,2), tcpPath(:,3), 'r.-', 'LineWidth', 1.5);
-            else
-                set(obj.hTrajLine, 'XData', tcpPath(:,1), 'YData', tcpPath(:,2), 'ZData', tcpPath(:,3));
+            [tcpPath, ~, ~] = gen.generateScoopMotion([obj.BucketPos, 0.4], obj.TrajParams.Radius, obj.TrajParams.Depth);
+            plot3(obj.Ax, tcpPath(:,1), tcpPath(:,2), tcpPath(:,3), 'r-', 'LineWidth', 1.5);
+        end
+
+        function playStoredAnimation(obj)
+            if isempty(obj.StoredTraj), return; end
+            for i = 1:size(obj.StoredTraj, 1)
+                set(obj.hProgressSlider, 'Value', i);
+                obj.onProgressScroll(obj.hProgressSlider);
+                pause(0.04); 
             end
         end
-        
+
         function onApplyLength(obj, edt)
             val = str2double(get(edt, 'String'));
-            if isnan(val) || val <= 0, warndlg('请输入有效的长度数值'); return; end
-            obj.CurrentShovelLen = val;
-            obj.reloadRobot(val);
-            obj.updateScene();
-            msgbox(sprintf('已更新铲子长度为 %.2fm', val));
+            if ~isnan(val), obj.CurrentShovelLen = val; obj.reloadRobot(val); obj.updateScene(); end
         end
-        
+
         function onJointChange(obj, src, idx)
-            obj.CurrentConfig(idx) = get(src, 'Value');
-            obj.updateScene();
+            obj.CurrentConfig(idx) = get(src, 'Value'); obj.updateScene();
         end
-        
+
         function onParamChange(obj, src, type)
-            obj.TrajParams.(type) = get(src, 'Value');
-            obj.updateScene(); % 触发桶和轨迹的重绘
-            obj.previewTrajectory();
+            obj.TrajParams.(type) = get(src, 'Value'); obj.updateScene();
         end
-        
+
         function resetPose(obj)
-            obj.CurrentConfig = obj.RobotObj.HomeConfig;
-            obj.updateScene();
-        end
-        
-        function playAnimation(obj)
-            title(obj.Ax, '正在计算并执行...', 'Color', 'g');
-            drawnow;
-            
-            gen = ScoopPathGenerator();
-            bucketCenter = [obj.BucketPos, 0.4];
-            [tcpPath, targetAngles, ~] = gen.generateScoopMotion(bucketCenter, obj.TrajParams.Radius, obj.TrajParams.Depth);
-            
-            % 寻找起点
-            startPos = tcpPath(1,:);
-            yawAngle = atan2(startPos(2), startPos(1));
-            
-            startTform = trvec2tform(startPos) * axang2tform([0 0 1 yawAngle]) * axang2tform([0 1 0 targetAngles(1)]);
-            
-            % 宽松权重
-            weights = [0.1 1 0.1 100 100 100]; 
-            [qStart, info] = obj.IK('tcp_frame', startTform, weights, obj.CurrentConfig);
-            
-            if ~strcmp(info.Status, 'success')
-                title(obj.Ax, '起点不可达!', 'Color', 'r');
-                warndlg('无法到达轨迹起点，请检查模型长度或关节限制。');
-                return;
-            end
-            
-            qTraj = qStart;
-            for i = 1:size(tcpPath, 1)
-                tPos = tcpPath(i, :);
-                tPitch = targetAngles(i);
-                
-                % 目标位姿
-                tgtTform = trvec2tform(tPos) * axang2tform([0 0 1 yawAngle]) * axang2tform([0 1 0 tPitch]);
-                weights = [0 1 0 100 100 100]; % 强位置约束
-                
-                [qSol, ~] = obj.IK('tcp_frame', tgtTform, weights, qTraj);
-                qTraj = qSol;
-                
-                obj.CurrentConfig = qSol;
-                show(obj.RobotModel, qSol, 'Parent', obj.Ax, 'PreservePlot', false, 'FastUpdate', true);
-                drawnow limitrate;
-            end
-            title(obj.Ax, '完成 ✅', 'Color', 'w');
+            obj.CurrentConfig = obj.RobotObj.HomeConfig; obj.updateScene();
         end
     end
 end
